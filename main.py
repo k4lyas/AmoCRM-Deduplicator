@@ -46,22 +46,22 @@ async def make_request(method, url, retries=3, **kwargs):
         except Exception as e:
             if attempt == retries - 1:
                 logger.error(f"Ошибка запроса {url}: {str(e)}")
-                return None
+                raise e # Прокидываем ошибку выше для жесткого контроля
             await asyncio.sleep(2 ** attempt)
     return None
 
 async def get_new_contact_data(contact_id):
     url = f"https://{AMO_DOMAIN}/api/v4/contacts/{contact_id}"
-    data = await make_request("GET", url)
-    if not data: return None
+    try:
+        data = await make_request("GET", url)
+    except Exception:
+        return None
     
+    if not data: return None
     if "Дубль" in data.get("name", ""):
         return "IS_DUPLICATE"
 
     cf = data.get("custom_fields_values") or []
-    
-    # logger.info(f"ВСЕ ПОЛЯ КОНТАКТА {contact_id}: {json.dumps(cf, ensure_ascii=False)}") (так надо)
-    
     tg, phone = None, None
     for f in cf:
         if f.get("field_id") == TG_FIELD_ID: tg = f.get("values")[0].get("value")
@@ -82,48 +82,95 @@ async def duplicate_research(phone, telegram, current_id):
         clean = query_str.replace("@", "").replace("+", "").replace(" ", "").strip()
         if len(clean) < 3: return
         url = f"https://{AMO_DOMAIN}/api/v4/contacts?query={clean}"
-        data = await make_request("GET", url)
-        if data and "_embedded" in data:
-            for c in data["_embedded"]["contacts"]:
-                c_id = int(c["id"])
-                if c_id != current_id and "Дубль" not in c.get("name", ""): 
-                    duplicates[c_id] = c
+        try:
+            data = await make_request("GET", url)
+            if data and "_embedded" in data:
+                for c in data["_embedded"]["contacts"]:
+                    c_id = int(c["id"])
+                    if c_id != current_id and "Дубль" not in c.get("name", ""): 
+                        duplicates[c_id] = c
+        except Exception:
+            pass
 
     await search(phone)
     await search(telegram)
     if not duplicates: return None
     return sorted(duplicates.values(), key=lambda x: x.get("created_at", float('inf')))[0]
 
+def is_strict_match(old_contact, new_contact):
+    # Жесткая валидация: очищаем от мусора и сравниваем
+    def clean(val):
+        return str(val).replace("+", "").replace("-", "").replace(" ", "").replace("@", "").strip().lower() if val else ""
+    
+    # Достаем телефон и ТГ деда
+    old_tg, old_phone = "", ""
+    cf = old_contact.get("custom_fields_values") or []
+    for f in cf:
+        if f.get("field_id") == TG_FIELD_ID: old_tg = clean(f.get("values")[0].get("value"))
+        elif f.get("field_code") == "PHONE": old_phone = clean(f.get("values")[0].get("value"))
+
+    new_phone = clean(new_contact.get('phone'))
+    new_tg = clean(new_contact.get('telegram_username'))
+
+    if new_phone and new_phone in old_phone: return True
+    if old_phone and old_phone in new_phone: return True
+    if new_tg and new_tg == old_tg: return True
+    
+    return False
+
 async def transfer_notes(from_id, to_id):
     url = f"https://{AMO_DOMAIN}/api/v4/contacts/{from_id}/notes"
-    notes_data = await make_request("GET", url)
+    try:
+        notes_data = await make_request("GET", url)
+    except Exception:
+        return
+        
     if not notes_data or "_embedded" not in notes_data: return
     
     notes = notes_data["_embedded"]["notes"]
     dest_url = f"https://{AMO_DOMAIN}/api/v4/contacts/{to_id}/notes"
     
     for note in notes:
-        if note.get("note_type") == "common":
-            payload = [{"note_type": "common", "params": {"text": note["params"]["text"]}}]
+        note_type = note.get("note_type", "unknown")
+        # Вытаскиваем текст, даже если это звонок или системное сообщение
+        text = note.get("params", {}).get("text") or str(note.get("params", {}))
+        
+        payload = [{"note_type": "common", "params": {"text": f"[{note_type}] {text}"}}]
+        try:
             await make_request("POST", dest_url, json=payload)
+        except Exception as e:
+            logger.error(f"Не удалось перенести примечание {note['id']}: {e}")
+            
     logger.info(f"Перенесено примечаний: {len(notes)}")
 
 async def transfer_leads(from_id, to_id):
     url = f"https://{AMO_DOMAIN}/api/v4/contacts/{from_id}/links"
-    links_data = await make_request("GET", url)
-    if not links_data or "_embedded" not in links_data: return
+    try:
+        links_data = await make_request("GET", url)
+    except Exception:
+        return True # Если связей нет, считаем успешным
+        
+    if not links_data or "_embedded" not in links_data: return True
     
     leads = [l for l in links_data["_embedded"]["links"] if l["to_entity_type"] == "leads"]
+    
     for lead in leads:
         lead_id = lead["to_entity_id"]
         
         link_url = f"https://{AMO_DOMAIN}/api/v4/leads/{lead_id}/link"
-        await make_request("POST", link_url, json=[{"to_entity_id": to_id, "to_entity_type": "contacts"}])
-        
         unlink_url = f"https://{AMO_DOMAIN}/api/v4/leads/{lead_id}/unlink"
-        await make_request("POST", unlink_url, json=[{"to_entity_id": from_id, "to_entity_type": "contacts"}])
         
-    logger.info(f"Перепривязано сделок: {len(leads)}")
+        try:
+            # Сначала пытаемся привязать к деду
+            await make_request("POST", link_url, json=[{"to_entity_id": to_id, "to_entity_type": "contacts"}])
+            # Если привязалось без ошибок - отвязываем от клона
+            await make_request("POST", unlink_url, json=[{"to_entity_id": from_id, "to_entity_type": "contacts"}])
+        except Exception as e:
+            logger.error(f"Ошибка при переносе сделки {lead_id}. Останавливаем процесс удаления клона.")
+            return False # Возвращаем False, чтобы отменить удаление
+            
+    logger.info(f"Успешно перепривязано сделок: {len(leads)}")
+    return True
 
 async def enrich_old_contact(old_contact, new_contact):
     cf = old_contact.get("custom_fields_values") or []
@@ -141,20 +188,25 @@ async def enrich_old_contact(old_contact, new_contact):
     if update_fields:
         url = f"https://{AMO_DOMAIN}/api/v4/contacts"
         payload = [{"id": old_contact["id"], "custom_fields_values": update_fields}]
-        await make_request("PATCH", url, json=payload)
-        logger.info(f"Обогатили деда новыми данными из клона.")
+        try:
+            await make_request("PATCH", url, json=payload)
+            logger.info(f"Обогатили деда новыми данными из клона.")
+        except Exception:
+            pass
 
 async def strategy_delete(old_id, new_id):
     delete_url = f"https://{AMO_DOMAIN}/api/v4/contacts/{new_id}"
-    res = await make_request("DELETE", delete_url)
-    
-    if res == "METHOD_NOT_ALLOWED":
-        logger.info(f"DELETE запрещен (тариф). Делаем мягкое удаление (переименование).")
-        update_url = f"https://{AMO_DOMAIN}/api/v4/contacts"
-        payload = [{"id": new_id, "name": f"Дубль (ID {old_id})"}]
-        await make_request("PATCH", update_url, json=payload)
-    else:
-        logger.info("Клон успешно удален физически.")
+    try:
+        res = await make_request("DELETE", delete_url)
+        if res == "METHOD_NOT_ALLOWED":
+            logger.info(f"DELETE запрещен. Делаем мягкое удаление (переименование).")
+            update_url = f"https://{AMO_DOMAIN}/api/v4/contacts"
+            payload = [{"id": new_id, "name": f"Дубль (ID {old_id})"}]
+            await make_request("PATCH", update_url, json=payload)
+        else:
+            logger.info("Клон успешно удален физически.")
+    except Exception as e:
+        logger.error(f"Ошибка при удалении/переименовании клона: {e}")
 
 async def merge_and_delete(old_contact, new_contact):
     old_id, new_id = old_contact['id'], new_contact['id']
@@ -162,10 +214,15 @@ async def merge_and_delete(old_contact, new_contact):
     
     await enrich_old_contact(old_contact, new_contact)
     await transfer_notes(new_id, old_id)
-    await transfer_leads(new_id, old_id)
-    await strategy_delete(old_id, new_id)
     
-    logger.info(f"Слияние завершено успешно.")
+    # Проверяем, успешно ли перенеслись сделки
+    leads_transferred = await transfer_leads(new_id, old_id)
+    
+    if leads_transferred:
+        await strategy_delete(old_id, new_id)
+        logger.info(f"Слияние завершено успешно.")
+    else:
+        logger.warning("Слияние прервано: не удалось перенести все сделки, клон сохранен для безопасности.")
 
 @app.post('/webhook')
 async def amo_webhook(request: Request):
@@ -178,31 +235,29 @@ async def amo_webhook(request: Request):
         contact_id = int(contact_id_raw)
         
         if contact_id in processing_contacts:
-            logger.info(f"Вебхук отклонен: контакт {contact_id} уже в процессе обработки.")
+            logger.info(f"Вебхук отклонен: контакт {contact_id} уже в процессе.")
             return {"status": "already_processing"}
             
         processing_contacts.add(contact_id)
         
         try:
-            logger.info(f"Обрабатываем контакт ID: {contact_id}")
             new_contact = await get_new_contact_data(contact_id)
-            
             if new_contact == "IS_DUPLICATE":
-                logger.info("Контакт уже помечен как 'Дубль'. Останавливаемся.")
                 return {"status": "already_processed"}
-                
             if not new_contact: 
                 return {"status": "error"}
 
-            logger.info(f"Ищем дубли для: тел={new_contact['phone']}, тг={new_contact['telegram_username']}")
             old_contact = await duplicate_research(new_contact['phone'], new_contact['telegram_username'], contact_id)
             
             if old_contact:
                 if old_contact['created_at'] >= new_contact['created_at']:
-                    logger.info("Мы обрабатываем Оригинал (он старше найденного дубля). Отменяем обратное слияние.")
+                    logger.info("Это Оригинал. Отменяем обратное слияние.")
                 else:
-                    logger.info(f"Найден старый контакт ID {old_contact['id']}! Запускаем перенос.")
-                    await merge_and_delete(old_contact, new_contact)
+                    if is_strict_match(old_contact, new_contact):
+                        logger.info(f"Найдено 100% совпадение с дедом (ID {old_contact['id']})! Запускаем перенос.")
+                        await merge_and_delete(old_contact, new_contact)
+                    else:
+                        logger.info("Найден похожий контакт, но жесткая валидация провалилась (разные номера). Пропускаем.")
             else:
                 logger.info("Дубли не найдены.")
                 
